@@ -274,6 +274,71 @@ About Queryset Methods
     it is only possible to pass fields on the base model into these methods.
 
 
+Async Support
+-------------
+
+All polymorphic querysets support async iteration and the following async methods:
+
+*   :meth:`~polymorphic.managers.PolymorphicQuerySet.aiterator` - Asynchronously iterate
+    over the queryset with polymorphic downcasting and chunking support.
+*   :meth:`~polymorphic.managers.PolymorphicQuerySet.aget` - Asynchronously fetch a single
+    polymorphic object matching the given criteria.
+*   :meth:`~polymorphic.managers.PolymorphicQuerySet.afirst` - Asynchronously return the
+    first polymorphic result or ``None``.
+*   :meth:`~polymorphic.managers.PolymorphicQuerySet.alast` - Asynchronously return the
+    last polymorphic result or ``None``.
+*   :meth:`~polymorphic.managers.PolymorphicQuerySet.acount` - Asynchronously count
+    the number of polymorphic results.
+*   :meth:`~polymorphic.managers.PolymorphicQuerySet.aexists` - Asynchronously check if
+    any polymorphic results exist.
+
+Async iteration (``async for``) is also fully supported and preserves polymorphic downcasting:
+
+.. code-block:: python
+
+    async for obj in ModelA.objects.all():
+        assert isinstance(obj, ModelA)
+        print(obj.field1)
+
+Using ``aiterator`` with chunking for large datasets:
+
+.. code-block:: python
+
+    async for obj in ModelA.objects.aiterator(chunk_size=5000):
+        process(obj)
+
+All polymorphic queryset features work identically in async contexts, including:
+
+*   :meth:`~polymorphic.managers.PolymorphicQuerySet.instance_of` and
+    :meth:`~polymorphic.managers.PolymorphicQuerySet.not_instance_of`
+*   :meth:`~polymorphic.managers.PolymorphicQuerySet.non_polymorphic`
+*   Queryset :meth:`~django.db.models.query.QuerySet.union`
+*   Cross-database configurations
+*   Polymorphic field path translation (e.g. ``ModelB___field2``)
+
+.. code-block:: python
+
+    # Filtering in async context
+    obj = await ModelA.objects.instance_of(ModelB).aget(field1='value')
+
+    # Non-polymorphic async queries
+    async for obj in ModelA.objects.non_polymorphic().aiterator():
+        process(obj)
+
+.. note::
+
+    Async operations do not use ``sync_to_async`` wrappers around the synchronous queryset
+    methods internally. Instead, they are implemented natively with proper async chunked
+    iteration and maintain the same polymorphic downcasting behavior as their synchronous
+    counterparts with no additional SQL queries.
+
+.. note::
+
+    The ``acount`` and ``aexists`` methods use ``non_polymorphic`` internally since
+    counting and existence checks do not require polymorphic downcasting. This avoids
+    unnecessary overhead while producing the same results.
+
+
 Using enhanced Q-objects in any Places
 --------------------------------------
 

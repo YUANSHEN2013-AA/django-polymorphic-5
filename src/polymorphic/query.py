@@ -7,15 +7,17 @@ from __future__ import annotations
 import copy
 import heapq
 from collections import defaultdict
-from collections.abc import Collection, Iterable, Iterator, Sequence
+from collections.abc import AsyncIterator, Collection, Iterable, Iterator, Sequence
 from typing import TYPE_CHECKING, Any, Generic, cast, overload
 
+from asgiref.sync import sync_to_async
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import FieldDoesNotExist
 from django.db import connections, models
 from django.db.models import FilteredRelation, Q
 from django.db.models.expressions import Combinable
 from django.db.models.query import ModelIterable, QuerySet
+from django.db.models.sql.constants import GET_ITERATOR_CHUNK_SIZE
 from typing_extensions import Self, TypeVar
 
 from .query_translate import (
@@ -77,6 +79,54 @@ class PolymorphicModelIterable(BasePolymorphicModelIterable, Generic[_All, _Base
         if self.queryset.polymorphic_disabled:
             return base_iter
         return self._polymorphic_iterator(base_iter)
+
+    def __aiter__(self) -> AsyncIterator[_All]:
+        if self.queryset.polymorphic_disabled:
+            return super().__aiter__()
+        return self._async_polymorphic_generator()
+
+    async def _async_polymorphic_generator(self) -> AsyncIterator[_All]:
+        max_chunk = connections[self.queryset.db].features.max_query_params
+        sql_chunk = self.chunk_size if self.chunked_fetch else None
+        if max_chunk:
+            sql_chunk = (
+                max_chunk
+                if not self.chunked_fetch
+                else min(max_chunk, self.chunk_size or max_chunk)
+            )
+
+        sql_chunk = sql_chunk or Polymorphic_QuerySet_objects_per_request
+
+        base_iter = await sync_to_async(super().__iter__)()
+
+        def collect_chunk(iterable, size):
+            chunk = []
+            reached_end = False
+            for _ in range(size):
+                try:
+                    chunk.append(next(iterable))
+                except StopIteration:
+                    reached_end = True
+                    break
+            return chunk, reached_end
+
+        while True:
+            base_result_objects, reached_end = await sync_to_async(
+                collect_chunk
+            )(base_iter, sql_chunk)
+
+            if not base_result_objects:
+                return
+
+            real_instances = await sync_to_async(
+                self.queryset._get_real_instances
+            )(base_result_objects)
+
+            for obj in real_instances:
+                yield obj
+
+            if reached_end:
+                return
 
     def _polymorphic_iterator(self, base_iter: Iterator[_All]) -> Iterator[_All]:
         """
@@ -168,16 +218,6 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
         # to that queryset as well).
         self.polymorphic_deferred_loading = (set(), True)
 
-    def _clone(self, *args: Any, **kwargs: Any) -> Self:
-        # Django's _clone only copies its own variables, so we need to copy ours here
-        new = cast(Self, super()._clone(*args, **kwargs))  # type: ignore[misc]
-        new.polymorphic_disabled = self.polymorphic_disabled
-        new.polymorphic_deferred_loading = (
-            copy.copy(self.polymorphic_deferred_loading[0]),
-            self.polymorphic_deferred_loading[1],
-        )
-        return new
-
     @classmethod
     def as_manager(cls) -> models.Manager[_All]:
         """
@@ -206,6 +246,17 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
         for obj in objs:
             obj.pre_save_polymorphic()
         return super().bulk_create(objs, batch_size, ignore_conflicts=ignore_conflicts)
+
+    def _clone(self, *args: Any, **kwargs: Any) -> Self:
+        new = cast(Self, super()._clone(*args, **kwargs))  # type: ignore[misc]
+        new.polymorphic_disabled = self.polymorphic_disabled
+        new.polymorphic_deferred_loading = (
+            copy.copy(self.polymorphic_deferred_loading[0]),
+            self.polymorphic_deferred_loading[1],
+        )
+        if hasattr(self, "_iterable_class") and hasattr(new, "_iterable_class"):
+            new._iterable_class = self._iterable_class  # type: ignore[misc]
+        return new
 
     def non_polymorphic(self) -> PolymorphicQuerySet[_Base, _Base]:
         """switch off polymorphic behaviour for this query.
@@ -699,3 +750,77 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
         disrupts the model hierarchy/relationship traversal.
         """
         return QuerySet.delete(self.non_polymorphic())
+
+    def __aiter__(self) -> AsyncIterator[_All]:
+        if self._iterable_class is PolymorphicModelIterable:
+            return PolymorphicModelIterable(
+                self,
+                chunked_fetch=True,
+                chunk_size=GET_ITERATOR_CHUNK_SIZE,
+            ).__aiter__()
+        return super().__aiter__()
+
+    async def aiterator(self, chunk_size: int | None = 2000) -> AsyncIterator[_All]:
+        if self._iterable_class is PolymorphicModelIterable:
+            use_chunked_fetch = not connections[self.db].settings_dict.get(
+                "DISABLE_SERVER_SIDE_CURSORS"
+            )
+            return PolymorphicModelIterable(
+                self,
+                chunked_fetch=use_chunked_fetch,
+                chunk_size=chunk_size or GET_ITERATOR_CHUNK_SIZE,
+            ).__aiter__()
+        return super().aiterator(chunk_size=chunk_size)  # type: ignore[call-arg]
+
+    async def aget(self, *args: Any, **kwargs: Any) -> _All:
+        clone = self._chain() if self.query.combinator else self.filter(*args, **kwargs)
+        if clone.query.can_filter():
+            clone = clone.order_by()
+        limit = None
+        if (
+            not clone.query.select_for_update
+            or connections[self.db].features.supports_select_for_update_with_limit
+        ):
+            from django.db.models.query import MAX_GET_RESULTS
+
+            limit = MAX_GET_RESULTS
+        if limit is not None:
+            clone = clone[:limit]
+        results: list[_All] = []
+        async for obj in cast(AsyncIterator[_All], clone):
+            results.append(obj)
+        num = len(results)
+        if num == 1:
+            return results[0]
+        if not num:
+            raise clone.model.DoesNotExist(
+                f"{clone.model._meta.object_name} matching query does not exist."
+            )
+        raise clone.model.MultipleObjectsReturned(
+            f"get() returned more than one {clone.model._meta.object_name} "
+            f"-- it returned {num}!"
+        )
+
+    async def afirst(self) -> _All | None:
+        async for obj in cast(
+            AsyncIterator[_All],
+            (self if self.ordered else self.order_by("pk"))[:1],
+        ):
+            return obj
+        return None
+
+    async def alast(self) -> _All | None:
+        async for obj in cast(
+            AsyncIterator[_All],
+            (self if self.ordered else self.order_by("pk")).reverse()[:1],
+        ):
+            return obj
+        return None
+
+    async def acount(self) -> int:
+        qs = self.non_polymorphic()
+        result = await sync_to_async(qs.aggregate)(count=models.Count("*"))
+        return result["count"]
+
+    async def aexists(self) -> bool:
+        return await self.non_polymorphic().aexists()
