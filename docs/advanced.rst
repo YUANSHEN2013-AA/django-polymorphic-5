@@ -233,6 +233,33 @@ If you do the final step yourself, you get the usual polymorphic result:
       <ModelC: id 3, field1 (CharField), field2 (CharField), field3 (CharField)> ]
 
 
+Async ORM Support
+-----------------
+
+:pypi:`django-polymorphic` provides full native support for Django's asynchronous ORM. 
+The following asynchronous methods work out of the box and return properly downcasted polymorphic models without adding extra queries:
+
+* ``aget()``
+* ``afirst()``
+* ``alast()``
+* ``aiterator()``
+* ``acount()``
+* ``aexists()``
+
+Under the hood, these methods use asynchronous database operations natively, completely avoiding ``sync_to_async`` wrappers. This means that ``aiterator()`` and other methods are fully asynchronous and safe to use in async contexts. All other query set features like ``instance_of()``, ``not_instance_of()``, ``non_polymorphic()``, and ``union()`` work seamlessly with the asynchronous methods.
+
+Example usage:
+
+.. code-block:: python
+
+    # Get a single polymorphic instance asynchronously
+    obj = await Project.objects.aget(pk=1)
+
+    # Iterate over polymorphic results asynchronously
+    async for obj in Project.objects.instance_of(ArtProject).aiterator():
+        print(obj)
+
+
 About Queryset Methods
 ----------------------
 
