@@ -274,6 +274,70 @@ About Queryset Methods
     it is only possible to pass fields on the base model into these methods.
 
 
+Async ORM Support
+-----------------
+
+Since Django 5.1, Django's QuerySet offers async equivalents of the common query methods.
+:pypi:`django-polymorphic` extends this support by ensuring that all async methods return
+**downcast** (real subclass) instances when polymorphic behavior is enabled. The following
+async methods are available on :class:`~polymorphic.managers.PolymorphicQuerySet`:
+
+*   :meth:`~polymorphic.managers.PolymorphicQuerySet.aget` — async equivalent of ``get()``
+*   :meth:`~polymorphic.managers.PolymorphicQuerySet.afirst` — async equivalent of ``first()``
+*   :meth:`~polymorphic.managers.PolymorphicQuerySet.alast` — async equivalent of ``last()``
+*   :meth:`~polymorphic.managers.PolymorphicQuerySet.aiterator` — async iterator with chunking
+*   :meth:`~polymorphic.managers.PolymorphicQuerySet.acount` — async count
+*   :meth:`~polymorphic.managers.PolymorphicQuerySet.aexists` — async exists
+
+**Async iteration** (``async for ... in queryset``) is also supported and yields downcast
+instances.
+
+.. code-block:: python
+
+    from polymorphic.models import PolymorphicModel
+
+    class ModelA(PolymorphicModel):
+        field1 = models.CharField(max_length=10)
+
+    class ModelB(ModelA):
+        field2 = models.CharField(max_length=10)
+
+    # In an async context (view, task, etc.)
+    async def example():
+        # aget() returns a real subclass instance
+        obj = await ModelA.objects.aget(pk=1)   # returns ModelB if pk=1 is a ModelB
+
+        # afirst() returns the first real instance
+        obj = await ModelA.objects.afirst()
+
+        # alast() returns the last real instance
+        obj = await ModelA.objects.order_by('pk').alast()
+
+        # aiterator() streams downcast objects in chunks
+        async for obj in ModelA.objects.aiterator():
+            print(obj.__class__)   # ModelA, ModelB, ...
+
+        # async for iteration also yields downcast objects
+        async for obj in ModelA.objects.all():
+            print(obj.__class__)   # ModelA, ModelB, ...
+
+        # acount() and aexists() work normally
+        count = await ModelA.objects.acount()
+        exists = await ModelA.objects.filter(pk=1).aexists()
+
+All filter methods (:meth:`~polymorphic.managers.PolymorphicQuerySet.instance_of`,
+:meth:`~polymorphic.managers.PolymorphicQuerySet.not_instance_of`, ``Q(instance_of=...)``)
+work correctly in the async context, since they modify the queryset itself and the async
+retrieval step then operates on the filtered queryset. :meth:`~polymorphic.managers.PolymorphicQuerySet.non_polymorphic`
+also works with async methods — when called, async methods return base-class instances
+rather than real subclass instances, mirroring the synchronous behavior.
+
+Queryset combination (:meth:`~django.db.models.query.QuerySet.union`,
+:meth:`~django.db.models.query.QuerySet.intersection`, :meth:`~django.db.models.query.QuerySet.difference`)
+also produce :class:`~polymorphic.managers.PolymorphicQuerySet` instances whose async
+iterators correctly yield downcast instances.
+
+
 Using enhanced Q-objects in any Places
 --------------------------------------
 

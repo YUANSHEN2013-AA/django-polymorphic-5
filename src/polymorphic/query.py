@@ -7,9 +7,12 @@ from __future__ import annotations
 import copy
 import heapq
 from collections import defaultdict
-from collections.abc import Collection, Iterable, Iterator, Sequence
+from collections.abc import AsyncIterator, Collection, Iterable, Iterator, Sequence
 from typing import TYPE_CHECKING, Any, Generic, cast, overload
 
+from itertools import islice
+
+from asgiref.sync import sync_to_async
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import FieldDoesNotExist
 from django.db import connections, models
@@ -72,6 +75,17 @@ class PolymorphicModelIterable(BasePolymorphicModelIterable, Generic[_All, _Base
 
     queryset: "PolymorphicQuerySet[_All, _Base]"
 
+    def _get_chunk_size(self) -> int:
+        max_chunk = connections[self.queryset.db].features.max_query_params
+        sql_chunk = self.chunk_size if self.chunked_fetch else None
+        if max_chunk:
+            sql_chunk = (
+                max_chunk
+                if not self.chunked_fetch  # chunk_size was not provided
+                else min(max_chunk, self.chunk_size or max_chunk)
+            )
+        return sql_chunk or Polymorphic_QuerySet_objects_per_request
+
     def __iter__(self) -> Iterator[_All]:
         base_iter = super().__iter__()
         if self.queryset.polymorphic_disabled:
@@ -88,26 +102,12 @@ class PolymorphicModelIterable(BasePolymorphicModelIterable, Generic[_All, _Base
         but it requests the objects in chunks from the database,
         with QuerySet.iterator(chunk_size) per chunk
         """
-
-        # some databases have a limit on the number of query parameters, we must
-        # respect this for generating get_real_instances queries because those
-        # queries do a large WHERE IN clause with primary keys
-        max_chunk = connections[self.queryset.db].features.max_query_params
-        sql_chunk = self.chunk_size if self.chunked_fetch else None
-        if max_chunk:
-            sql_chunk = (
-                max_chunk
-                if not self.chunked_fetch  # chunk_size was not provided
-                else min(max_chunk, self.chunk_size or max_chunk)
-            )
-
-        sql_chunk = sql_chunk or Polymorphic_QuerySet_objects_per_request
+        sql_chunk = self._get_chunk_size()
 
         while True:
-            base_result_objects = []
+            base_result_objects: list[_All] = []
             reached_end = False
 
-            # Fetch in chunks
             for _ in range(sql_chunk):
                 try:
                     o = next(base_iter)
@@ -120,6 +120,50 @@ class PolymorphicModelIterable(BasePolymorphicModelIterable, Generic[_All, _Base
 
             if reached_end:
                 return
+
+    async def _async_polymorphic_iterator(self) -> AsyncIterator[_All]:
+        """
+        Async version of _polymorphic_iterator.
+
+        Iterates over base objects using the parent iterable,
+        groups them into chunks and applies _get_real_instances
+        to preserve polymorphic downcast behavior.
+        """
+        if self.queryset.polymorphic_disabled:
+            async for item in super().__aiter__():
+                yield item
+            return
+
+        sql_chunk = self._get_chunk_size()
+
+        # We iterate through the base iterable asynchronously via sync_to_async
+        # on chunks of the sync iterator. The key is that _get_real_instances
+        # is called per-chunk to preserve the polymorphic downcast behavior.
+        sync_base_iter: Iterator[_All] = super().__iter__()
+
+        def _next_chunk(gen: Iterator[_All]) -> tuple[list[_All], bool]:
+            chunk: list[_All] = []
+            for _ in range(sql_chunk):
+                try:
+                    chunk.append(next(gen))
+                except StopIteration:
+                    return chunk, True
+            return chunk, False
+
+        while True:
+            chunk, reached_end = await sync_to_async(_next_chunk)(sync_base_iter)
+            if chunk:
+                for real_instance in self.queryset._get_real_instances(chunk):
+                    yield real_instance
+            if reached_end:
+                return
+
+    def __aiter__(self) -> AsyncIterator[_All]:
+        """
+        Async iterator that yields real (downcast) instances
+        when qs.polymorphic_disabled is False.
+        """
+        return self._async_polymorphic_iterator()
 
 
 def transmogrify(cls: type[_All], obj: models.Model) -> _All:
@@ -699,3 +743,155 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
         disrupts the model hierarchy/relationship traversal.
         """
         return QuerySet.delete(self.non_polymorphic())
+
+    # -- Async support ------------------------------------------------------------
+
+    def __aiter__(self) -> AsyncIterator[_All]:
+        """
+        Async iterator for PolymorphicQuerySet.
+
+        Ensures that async-for loops over the queryset yield real (downcast)
+        instances when polymorphic behavior is enabled.
+
+        When ``polymorphic_disabled`` is True, delegates to the default Django
+        async iterator.
+        """
+        if self.polymorphic_disabled:
+            return super().__aiter__()
+
+        async def _async_generator() -> AsyncIterator[_All]:
+            # Use our PolymorphicModelIterable which already handles downcast
+            # via sync_to_async.  Fetch all into cache like the sync version,
+            # then yield asynchronously.
+            await sync_to_async(self._fetch_all)()
+            for item in self._result_cache:
+                yield item
+
+        return _async_generator()
+
+    def aiterator(self, chunk_size: int | None = None) -> AsyncIterator[_All]:
+        """
+        Async iterator that yields real (downcast) instances.
+
+        Supports chunking for memory efficiency, just like the sync ``iterator``
+        method, but uses async I/O under the hood.
+        """
+        if self.polymorphic_disabled:
+            return super().aiterator(chunk_size)
+
+        use_chunked_fetch = chunk_size is not None
+        iterable = self._iterable_class(
+            self, chunked_fetch=use_chunked_fetch, chunk_size=chunk_size or 0
+        )
+        return iterable.__aiter__()
+
+    async def aget(self, *args: Any, **kwargs: Any) -> _All:
+        """
+        Async version of ``get``.
+
+        Performs the same query as ``get`` but in an async-safe manner, ensuring
+        the returned object is a real (downcast) instance if polymorphic
+        behavior is enabled.
+        """
+        # Filter via the sync method, then evaluate through the polymorphic
+        # iterable to get real instances.  The base get() already goes through
+        # _fetch_all -> _iterable_class, but we override to be explicit and
+        # guarantee polymorphic downcast even if Django internals change.
+        clone = self.filter(*args, **kwargs)
+        if self.query.combinator:
+            clone = self._clone()
+
+        def _do_get() -> _All:
+            num = len(clone)
+            if num == 1:
+                return cast(_All, clone._result_cache[0])
+            if not num:
+                raise self.model.DoesNotExist(
+                    f"{self.model._meta.object_name} matching query does not exist."
+                )
+            raise self.model.MultipleObjectsReturned(
+                f"get() returned more than one {self.model._meta.object_name} -- "
+                f"it returned {num}!"
+            )
+
+        return await sync_to_async(_do_get)()
+
+    async def afirst(self) -> _All | None:
+        """
+        Async version of ``first``.
+
+        Returns the first real (downcast) instance or ``None``.
+        """
+        if self.polymorphic_disabled:
+            return await super().afirst()
+
+        def _do_first() -> _All | None:
+            if self.ordered:
+                clone = self._clone()
+                clone.query.set_limits(high=1)
+                result_list = list(clone.iterator())
+                if result_list:
+                    return cast(_All, result_list[0])
+                return None
+            # Fallback without ordering
+            for result in self.iterator():
+                return cast(_All, result)
+            return None
+
+        return await sync_to_async(_do_first)()
+
+    async def alast(self) -> _All | None:
+        """
+        Async version of ``last``.
+
+        Returns the last real (downcast) instance or ``None``.
+        """
+        if self.polymorphic_disabled:
+            return await super().alast()
+
+        def _do_last() -> _All | None:
+            if not self.ordered:
+                clone = self._clone()
+                clone.query.clear_ordering(force_empty=False)
+                clone.query.add_ordering("-pk")
+                clone.query.set_limits(high=1)
+                result_list = list(clone.iterator())
+                return cast(_All, result_list[0]) if result_list else None
+            # Ordered queryset: reverse the ordering, take first
+            clone = self._clone()
+            ordering = list(clone.query.order_by)
+            if ordering:
+                reversed_order: list[Any] = []
+                for order in ordering:
+                    if isinstance(order, str):
+                        if order.startswith("-"):
+                            reversed_order.append(order[1:])
+                        else:
+                            reversed_order.append("-" + order)
+                    else:
+                        reversed_order.append(order)
+                clone.query.clear_ordering(force_empty=False)
+                clone.query.add_ordering(*reversed_order)
+            clone.query.set_limits(high=1)
+            result_list = list(clone.iterator())
+            return cast(_All, result_list[0]) if result_list else None
+
+        return await sync_to_async(_do_last)()
+
+    async def acount(self) -> int:
+        """
+        Async version of ``count``.
+
+        Returns the number of results matching the current queryset. This does
+        not perform polymorphic downcast; it is a simple SQL ``COUNT(*)``.
+        """
+        return await super().acount()
+
+    async def aexists(self) -> bool:
+        """
+        Async version of ``exists``.
+
+        Returns ``True`` if the queryset contains any results, ``False``
+        otherwise.  No downcast is needed for this operation.
+        """
+        return await super().aexists()
