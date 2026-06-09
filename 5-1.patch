@@ -1,0 +1,125 @@
+diff --git a/docs/advanced.rst b/docs/advanced.rst
+index ff29145..29d45f0 100644
+--- a/docs/advanced.rst
++++ b/docs/advanced.rst
+@@ -258,6 +258,19 @@ About Queryset Methods
+     supported. You can get back the old non-polymorphic behaviour by using
+     ``ModelA.objects.non_polymorphic().extra(...)``.
+ 
++*   :meth:`~polymorphic.managers.PolymorphicQuerySet.aget`,
++    :meth:`~polymorphic.managers.PolymorphicQuerySet.afirst`,
++    :meth:`~polymorphic.managers.PolymorphicQuerySet.alast`,
++    :meth:`~polymorphic.managers.PolymorphicQuerySet.aiterator`,
++    :meth:`~polymorphic.managers.PolymorphicQuerySet.acount`, and
++    :meth:`~polymorphic.managers.PolymorphicQuerySet.aexists` preserve the same polymorphic
++    behavior as their synchronous counterparts. Objects returned from async queries are still
++    downcast to their real model classes unless
++    :meth:`~polymorphic.managers.PolymorphicQuerySet.non_polymorphic` is used. This also applies to
++    querysets combined with :meth:`~polymorphic.managers.PolymorphicQuerySet.instance_of`,
++    :meth:`~polymorphic.managers.PolymorphicQuerySet.not_instance_of`, queryset ``union()``, custom
++    database aliases, and ``aiterator(chunk_size=...)`` chunked iteration.
++
+ *   :meth:`~polymorphic.managers.PolymorphicQuerySet.get_real_instances` allows you to turn a
+     queryset or list  of base model objects efficiently into the real objects.
+     For example, you could do ``base_objects_queryset=ModelA.extra(...).non_polymorphic()``
+diff --git a/src/polymorphic/query.py b/src/polymorphic/query.py
+index 7d55bd5..90cf27e 100644
+--- a/src/polymorphic/query.py
++++ b/src/polymorphic/query.py
+@@ -7,12 +7,13 @@ from __future__ import annotations
+ import copy
+ import heapq
+ from collections import defaultdict
+-from collections.abc import Collection, Iterable, Iterator, Sequence
++from collections.abc import AsyncIterator, Collection, Iterable, Iterator, Sequence
+ from typing import TYPE_CHECKING, Any, Generic, cast, overload
+ 
++from asgiref.sync import sync_to_async
+ from django.contrib.contenttypes.models import ContentType
+ from django.core.exceptions import FieldDoesNotExist
+-from django.db import connections, models
++from django.db import NotSupportedError, connections, models
+ from django.db.models import FilteredRelation, Q
+ from django.db.models.expressions import Combinable
+ from django.db.models.query import ModelIterable, QuerySet
+@@ -408,6 +409,80 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
+         qs = self.non_polymorphic()
+         return super(PolymorphicQuerySet, qs).aggregate(*args, **kwargs)
+ 
++    async def aget(self, *args: Any, **kwargs: Any) -> _All:
++        if self.query.combinator and (args or kwargs):
++            raise NotSupportedError(
++                f"Calling QuerySet.get(...) with filters after {self.query.combinator}() is not supported."
++            )
++
++        clone = self._chain() if self.query.combinator else self.filter(*args, **kwargs)
++        if self.query.can_filter() and not self.query.distinct_fields:
++            clone = clone.order_by()
++
++        limit = 21
++        limited = not clone.query.select_for_update or connections[
++            clone.db
++        ].features.supports_select_for_update_with_limit
++        if limited:
++            clone.query.set_limits(high=limit)
++
++        results: list[_All] = []
++        async for obj in clone.aiterator(chunk_size=limit):
++            results.append(obj)
++            if limited and len(results) >= limit:
++                break
++
++        num = len(results)
++        if num == 1:
++            return results[0]
++        if not num:
++            raise self.model.DoesNotExist(
++                f"{self.model._meta.object_name} matching query does not exist."
++            )
++
++        num_repr: int | str = num
++        if limited and num >= limit:
++            num_repr = f"more than {limit - 1}"
++        raise self.model.MultipleObjectsReturned(
++            f"get() returned more than one {self.model._meta.object_name} -- it returned {num_repr}!"
++        )
++
++    async def afirst(self) -> _All | None:
++        queryset = self
++        if not queryset.ordered:
++            queryset._check_ordering_first_last_queryset_aggregation(method="first")
++            queryset = queryset.order_by("pk")
++
++        async for obj in cast(Self, queryset[:1]).aiterator(chunk_size=1):
++            return obj
++        return None
++
++    async def alast(self) -> _All | None:
++        queryset = self
++        if queryset.ordered:
++            queryset = queryset.reverse()
++        else:
++            queryset._check_ordering_first_last_queryset_aggregation(method="last")
++            queryset = queryset.order_by("-pk")
++
++        async for obj in cast(Self, queryset[:1]).aiterator(chunk_size=1):
++            return obj
++        return None
++
++    async def aiterator(self, chunk_size: int = 2000) -> AsyncIterator[_All]:
++        async for item in super().aiterator(chunk_size=chunk_size):
++            yield cast(_All, item)
++
++    async def acount(self) -> int:
++        if self._result_cache is not None:
++            return len(self._result_cache)
++        return await sync_to_async(self.query.get_count)(using=self.db)
++
++    async def aexists(self) -> bool:
++        if self._result_cache is not None:
++            return bool(self._result_cache)
++        return await sync_to_async(self.query.has_results)(using=self.db)
++
+     # Starting with Django 1.9, the copy returned by 'qs.values(...)' has the
+     # same class as 'qs', so our polymorphic modifications would apply.
+     # We want to leave values queries untouched, so we set 'polymorphic_disabled'.

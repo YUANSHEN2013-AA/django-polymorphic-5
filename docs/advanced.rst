@@ -258,6 +258,19 @@ About Queryset Methods
     supported. You can get back the old non-polymorphic behaviour by using
     ``ModelA.objects.non_polymorphic().extra(...)``.
 
+*   :meth:`~polymorphic.managers.PolymorphicQuerySet.aget`,
+    :meth:`~polymorphic.managers.PolymorphicQuerySet.afirst`,
+    :meth:`~polymorphic.managers.PolymorphicQuerySet.alast`,
+    :meth:`~polymorphic.managers.PolymorphicQuerySet.aiterator`,
+    :meth:`~polymorphic.managers.PolymorphicQuerySet.acount`, and
+    :meth:`~polymorphic.managers.PolymorphicQuerySet.aexists` preserve the same polymorphic
+    behavior as their synchronous counterparts. Objects returned from async queries are still
+    downcast to their real model classes unless
+    :meth:`~polymorphic.managers.PolymorphicQuerySet.non_polymorphic` is used. This also applies to
+    querysets combined with :meth:`~polymorphic.managers.PolymorphicQuerySet.instance_of`,
+    :meth:`~polymorphic.managers.PolymorphicQuerySet.not_instance_of`, queryset ``union()``, custom
+    database aliases, and ``aiterator(chunk_size=...)`` chunked iteration.
+
 *   :meth:`~polymorphic.managers.PolymorphicQuerySet.get_real_instances` allows you to turn a
     queryset or list  of base model objects efficiently into the real objects.
     For example, you could do ``base_objects_queryset=ModelA.extra(...).non_polymorphic()``
