@@ -7,7 +7,7 @@ from __future__ import annotations
 import copy
 import heapq
 from collections import defaultdict
-from collections.abc import Collection, Iterable, Iterator, Sequence
+from collections.abc import AsyncIterator, Collection, Iterable, Iterator, Sequence
 from typing import TYPE_CHECKING, Any, Generic, cast, overload
 
 from django.contrib.contenttypes.models import ContentType
@@ -45,11 +45,11 @@ queryset.iterator() implementation
 
 if TYPE_CHECKING:
 
-    class BasePolymorphicModelIterable(ModelIterable[_All]):
+    class BasePolymorphicModelIterable(ModelIterable[_All]):  # type: ignore[type-arg]
         pass
 else:
 
-    class BasePolymorphicModelIterable(ModelIterable):
+    class BasePolymorphicModelIterable(ModelIterable):  # type: ignore[type-arg]
         pass
 
 
@@ -62,7 +62,7 @@ class _Inconsistent:
     ...
 
 
-class PolymorphicModelIterable(BasePolymorphicModelIterable, Generic[_All, _Base]):
+class PolymorphicModelIterable(BasePolymorphicModelIterable, Generic[_All, _Base]):  # type: ignore[type-arg]
     """
     ModelIterable for PolymorphicModel
 
@@ -70,13 +70,58 @@ class PolymorphicModelIterable(BasePolymorphicModelIterable, Generic[_All, _Base
     otherwise acts like a regular ModelIterable.
     """
 
-    queryset: "PolymorphicQuerySet[_All, _Base]"
+    queryset: "PolymorphicQuerySet[_All, _Base]"  # type: ignore[assignment]
 
     def __iter__(self) -> Iterator[_All]:
         base_iter = super().__iter__()
         if self.queryset.polymorphic_disabled:
             return base_iter
         return self._polymorphic_iterator(base_iter)
+
+    def __aiter__(self) -> AsyncIterator[_All]:
+        if self.queryset.polymorphic_disabled:
+            return super().__aiter__()
+        return self._async_polymorphic_iterator()
+
+    async def _async_polymorphic_iterator(self) -> AsyncIterator[_All]:
+        from asgiref.sync import sync_to_async
+
+        base_aiter = super().__aiter__()
+
+        max_chunk: int | None = connections[self.queryset.db].features.max_query_params
+        chunk_size: int = self.chunk_size  # type: ignore[has-type]
+        chunked_fetch: bool = self.chunked_fetch  # type: ignore[has-type]
+        sql_chunk: int | None = chunk_size if chunked_fetch else None
+        if max_chunk:
+            sql_chunk = (
+                max_chunk
+                if not chunked_fetch
+                else min(max_chunk, chunk_size or max_chunk)
+            )
+
+        effective_chunk: int = sql_chunk or Polymorphic_QuerySet_objects_per_request
+
+        _get_real = sync_to_async(self.queryset._get_real_instances)
+
+        while True:
+            base_result_objects: list[_All] = []
+            reached_end = False
+
+            for _ in range(effective_chunk):
+                try:
+                    o = await base_aiter.__anext__()
+                    base_result_objects.append(o)
+                except StopAsyncIteration:
+                    reached_end = True
+                    break
+
+            if base_result_objects:
+                real_instances = await _get_real(base_result_objects)  # type: ignore[arg-type]
+                for real_instance in real_instances:
+                    yield real_instance
+
+            if reached_end:
+                return
 
     def _polymorphic_iterator(self, base_iter: Iterator[_All]) -> Iterator[_All]:
         """
@@ -116,7 +161,7 @@ class PolymorphicModelIterable(BasePolymorphicModelIterable, Generic[_All, _Base
                     reached_end = True
                     break
 
-            yield from self.queryset._get_real_instances(base_result_objects)
+            yield from self.queryset._get_real_instances(base_result_objects)  # type: ignore[arg-type]
 
             if reached_end:
                 return
@@ -347,7 +392,7 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
         """
         ___lookup_assert_msg = "PolymorphicModel: annotate()/aggregate(): ___ model lookup supported for keyword arguments only"
 
-        def patch_lookup(a):
+        def patch_lookup(a: Any) -> None:
             # The field on which the aggregate operates is
             # stored inside a complex query expression.
             if isinstance(a, Q):
@@ -365,12 +410,12 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
             else:
                 a.name = translate_polymorphic_field_path(self.model, a.name)
 
-        def test___lookup(a):
+        def test___lookup(a: Any) -> None:
             """*args might be complex expressions too in django 1.8 so
             the testing for a '___' is rather complex on this one"""
             if isinstance(a, Q):
 
-                def tree_node_test___lookup(my_model, node):
+                def tree_node_test___lookup(my_model: type[models.Model], node: Any) -> None:
                     "process all children of this Q node"
                     for i in range(len(node.children)):
                         child = node.children[i]
@@ -652,7 +697,7 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
 
         return resultlist
 
-    def __repr__(self, *args, **kwargs):
+    def __repr__(self, *args: Any, **kwargs: Any) -> str:
         if self.model.polymorphic_query_multiline_output:
             result = ",\n  ".join(repr(o) for o in self.all())
             return f"[ {result} ]"
@@ -690,6 +735,100 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
             return olist
         clist = PolymorphicQuerySet._p_list_class(olist)
         return clist
+
+    def __aiter__(self) -> AsyncIterator[_All]:
+        if self._result_cache is not None:
+            cache = self._result_cache
+
+            async def _cached_generator() -> AsyncIterator[_All]:
+                for item in cache:
+                    yield item
+
+            return _cached_generator()
+        iterable = self._iterable_class(self)
+        return iterable.__aiter__()  # type: ignore[no-any-return]
+
+    async def aget(self, *args: Any, **kwargs: Any) -> _All:
+        clone = self.filter(*args, **kwargs)
+        if clone._result_cache is None:
+            results: list[_All] = []
+            async for obj in clone:
+                results.append(obj)
+                if len(results) > 1:
+                    raise self.model.MultipleObjectsReturned(  # type: ignore[union-attr]
+                        "%s matching query does not exist." % self.model._meta.object_name
+                    )
+            clone._result_cache = results
+        cache = clone._result_cache
+        if not cache:
+            raise self.model.DoesNotExist(  # type: ignore[union-attr]
+                "%s matching query does not exist." % self.model._meta.object_name
+            )
+        assert isinstance(cache, list)
+        return cache[0]
+
+    async def afirst(self) -> _All | None:
+        if self._result_cache is not None:
+            return self._result_cache[0] if self._result_cache else None  # type: ignore[index]
+        qs = self.order_by() if not self.query.standard_ordering else self
+        qs.query.clear_deferred_loading()
+        qs.query.clear_select_fields()
+        qs.query.set_limits(0, 1)
+        async for obj in qs:
+            return obj
+        return None
+
+    async def alast(self) -> _All | None:
+        if self._result_cache is not None:
+            return self._result_cache[-1] if self._result_cache else None  # type: ignore[index]
+        qs = self.reverse() if self.query.standard_ordering else self.order_by()
+        qs.query.clear_deferred_loading()
+        qs.query.clear_select_fields()
+        qs.query.set_limits(0, 1)
+        async for obj in qs:
+            return obj
+        return None
+
+    async def aiterator(self, chunk_size: int = 2000) -> AsyncIterator[_All]:
+        if chunk_size <= 0:
+            raise ValueError("Chunk size must be strictly positive.")
+        disable_server_side_cursors: bool | None = connections[self.db].settings_dict.get(
+            "DISABLE_SERVER_SIDE_CURSORS"
+        )
+        use_chunked_fetch = not disable_server_side_cursors
+        iterable = self._iterable_class(
+            self, chunked_fetch=use_chunked_fetch, chunk_size=chunk_size
+        )
+        if self._prefetch_related_lookups:  # type: ignore[attr-defined]
+            try:
+                from django.db.models.query import aprefetch_related_objects as _aprefetch
+            except ImportError:
+                from asgiref.sync import sync_to_async
+                from django.db.models.query import prefetch_related_objects
+
+                _aprefetch = sync_to_async(prefetch_related_objects)  # type: ignore[assignment]
+
+            results: list[_All] = []
+            async for item in iterable:
+                results.append(item)  # type: ignore[arg-type]
+                if len(results) >= chunk_size:
+                    await _aprefetch(results, *self._prefetch_related_lookups)  # type: ignore[arg-type]
+                    for result in results:
+                        yield result
+                    results.clear()
+            if results:
+                await _aprefetch(results, *self._prefetch_related_lookups)  # type: ignore[arg-type]
+                for result in results:
+                    yield result
+        else:
+            async for item in iterable:
+                yield item
+
+    async def acount(self) -> int:
+        return await QuerySet.acount(self)
+
+    async def aexists(self) -> bool:
+        return await QuerySet.aexists(self)
 
     def delete(self) -> tuple[int, dict[str, int]]:
         """

@@ -274,6 +274,76 @@ About Queryset Methods
     it is only possible to pass fields on the base model into these methods.
 
 
+Asynchronous Queryset Methods
+-----------------------------
+
+.. versionadded:: 4.12
+
+:pypi:`django-polymorphic` supports Django's asynchronous queryset interface. The following async
+methods are available on :class:`~polymorphic.managers.PolymorphicQuerySet` and return properly
+downcasted polymorphic instances:
+
+*   :meth:`~polymorphic.query.PolymorphicQuerySet.aget` — Like :meth:`~django.db.models.query.QuerySet.get`,
+    but async. Returns the real (downcasted) instance.
+
+*   :meth:`~polymorphic.query.PolymorphicQuerySet.afirst` — Like
+    :meth:`~django.db.models.query.QuerySet.first`, but async. Returns the real instance or ``None``.
+
+*   :meth:`~polymorphic.query.PolymorphicQuerySet.alast` — Like
+    :meth:`~django.db.models.query.QuerySet.last`, but async. Returns the real instance or ``None``.
+
+*   :meth:`~polymorphic.query.PolymorphicQuerySet.aiterator` — Like
+    :meth:`~django.db.models.query.QuerySet.aiterator`, but async. Iterates over real instances with
+    chunked fetching support. Accepts a ``chunk_size`` parameter (default 2000).
+
+*   :meth:`~polymorphic.query.PolymorphicQuerySet.acount` — Like
+    :meth:`~django.db.models.query.QuerySet.count`, but async. Returns the number of records.
+
+*   :meth:`~polymorphic.query.PolymorphicQuerySet.aexists` — Like
+    :meth:`~django.db.models.query.QuerySet.exists`, but async. Returns a boolean.
+
+All async methods maintain the same polymorphic downcast behavior as their synchronous counterparts.
+For example:
+
+.. code-block:: python
+
+    # Async iteration over polymorphic queryset
+    async for obj in Project.objects.all():
+        print(type(obj))  # ArtProject, ResearchProject, etc.
+
+    # Async get with downcast
+    obj = await Project.objects.aget(pk=2)
+    assert type(obj) is ArtProject
+
+    # Async first/last
+    first = await Project.objects.afirst()
+    last = await Project.objects.order_by("pk").alast()
+
+    # Async iterator with chunking
+    async for obj in Project.objects.aiterator(chunk_size=100):
+        process(obj)
+
+    # instance_of / not_instance_of work in async context
+    async for obj in Project.objects.instance_of(ArtProject):
+        assert isinstance(obj, ArtProject)
+
+    # non_polymorphic works in async context
+    async for obj in Project.objects.non_polymorphic():
+        assert type(obj) is Project  # no downcast
+
+.. note::
+
+    These methods are implemented using Django's native async ORM — they do **not** wrap the
+    synchronous methods with ``sync_to_async``. This means they can be safely used inside
+    ``async def`` views and other async contexts without blocking the event loop.
+
+.. note::
+
+    The ``aiterator()`` method supports server-side cursors on PostgreSQL for efficient
+    chunked fetching. On SQLite, chunked fetching is handled in-memory. The ``chunk_size``
+    parameter controls both the database fetch chunk size and the prefetch-related-objects
+    batch size.
+
 Using enhanced Q-objects in any Places
 --------------------------------------
 

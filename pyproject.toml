@@ -135,9 +135,11 @@ python_files = "test*.py"
 python_classes = "Test*"
 python_functions = "test_*"
 norecursedirs = "*.egg .eggs dist build docs .tox .git __pycache__"
+asyncio_mode = "auto"
 markers = [
   "integration: tests under examples/integrations (opt-in)",
   "ui: browser-based tests",
+  "postgres: PostgreSQL-specific tests",
 ]
 addopts = [
     "--strict-markers",
@@ -184,7 +186,7 @@ django_settings_module = "polymorphic.tests.settings"
 
 [tool.pyright]
 pythonVersion = "3.10"
-typeCheckingMode = "basic"
+typeCheckingMode = "strict"
 include = ["src/polymorphic"]
 exclude = [
   "**/migrations",
@@ -202,6 +204,11 @@ reportOptionalMemberAccess = false
 reportGeneralTypeIssues = false
 reportOptionalSubscript = false
 reportPrivateImportUsage = false
+reportUnknownMemberType = false
+reportUnknownVariableType = false
+reportUnknownArgumentType = false
+reportUnknownParameterType = false
+reportUnknownLambdaType = false
 
 
 [tool.bandit]
